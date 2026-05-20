@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bufio"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"tailscale.com/types/key"
 )
 
 func TestGetTailscaleTarget(t *testing.T) {
@@ -23,14 +26,14 @@ func TestGetTailscaleTarget(t *testing.T) {
 		auth   string
 		target string
 	}{
-		{name: "control protocol", path: "/ts2021", target: "controlplane.tailscale.com"},
-		{name: "api route", path: "/api/v2/tailnet", target: "controlplane.tailscale.com"},
-		{name: "machine route", path: "/machine/register", target: "controlplane.tailscale.com"},
-		{name: "derp route", path: "/derp/map", target: "derp.tailscale.com"},
-		{name: "web login route", path: "/login", target: "login.tailscale.com"},
-		{name: "tailscale auth request", path: "/auth", ua: "tailscale/1.0", target: "login.tailscale.com"},
-		{name: "tailscale authenticated request", path: "/device", ua: "tailscale/1.0", auth: "Bearer token", target: "controlplane.tailscale.com"},
-		{name: "default web route", path: "/", ua: "Mozilla/5.0", target: "login.tailscale.com"},
+		{name: "control protocol", path: "/ts2021", target: upstreamRoleControl},
+		{name: "api route", path: "/api/v2/tailnet", target: upstreamRoleControl},
+		{name: "machine route", path: "/machine/register", target: upstreamRoleControl},
+		{name: "derp route", path: "/derp/map", target: upstreamRoleDERP},
+		{name: "web login route", path: "/login", target: upstreamRoleLogin},
+		{name: "tailscale auth request", path: "/auth", ua: "tailscale/1.0", target: upstreamRoleLogin},
+		{name: "tailscale authenticated request", path: "/device", ua: "tailscale/1.0", auth: "Bearer token", target: upstreamRoleControl},
+		{name: "default web route", path: "/", ua: "Mozilla/5.0", target: upstreamRoleLogin},
 	}
 
 	for _, tt := range tests {
@@ -114,6 +117,60 @@ func TestRewriteTailscaleURLsInBody(t *testing.T) {
 	}
 }
 
+func TestRewriteTailscaleURLCustomUpstream(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://headscale.example.com"),
+		control: mustParseURL(t, "https://headscale.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	if got := rewriteTailscaleURL("https://headscale.example.com/register"); got != "https://proxy.example.com/register" {
+		t.Fatalf("rewriteTailscaleURL(custom) = %q", got)
+	}
+	if got := rewriteTailscaleURL("//headscale.example.com/login"); got != "//proxy.example.com/login" {
+		t.Fatalf("rewriteTailscaleURL(protocol relative custom) = %q", got)
+	}
+	if got := rewriteTailscaleURL("https://proxy.example.com/register"); got != "https://proxy.example.com/register" {
+		t.Fatalf("rewriteTailscaleURL(proxy) = %q", got)
+	}
+}
+
+func TestParseUpstreamConfig(t *testing.T) {
+	t.Run("custom control keeps default derp", func(t *testing.T) {
+		cfg, err := parseUpstreamConfig("https://headscale.example.com", "")
+		if err != nil {
+			t.Fatalf("parseUpstreamConfig returned error: %v", err)
+		}
+		if got := cfg.control.String(); got != "https://headscale.example.com" {
+			t.Fatalf("control upstream = %q", got)
+		}
+		if got := cfg.login.String(); got != "https://headscale.example.com" {
+			t.Fatalf("login upstream = %q", got)
+		}
+		if got := cfg.derp.String(); got != "https://derp.tailscale.com" {
+			t.Fatalf("derp upstream = %q", got)
+		}
+	})
+
+	t.Run("custom derp override", func(t *testing.T) {
+		cfg, err := parseUpstreamConfig("https://headscale.example.com", "https://derp.example.com:4443")
+		if err != nil {
+			t.Fatalf("parseUpstreamConfig returned error: %v", err)
+		}
+		if got := cfg.derp.String(); got != "https://derp.example.com:4443" {
+			t.Fatalf("derp upstream = %q", got)
+		}
+	})
+
+	t.Run("rejects invalid control upstream", func(t *testing.T) {
+		if _, err := parseUpstreamConfig("http://headscale.example.com/path", ""); err == nil {
+			t.Fatal("expected validation error")
+		}
+	})
+}
+
 func TestSetupXForwardedHeaders(t *testing.T) {
 	t.Run("adds headers in http only mode", func(t *testing.T) {
 		withProxyTestGlobals(t)
@@ -178,11 +235,11 @@ func TestBuildMainHandlerRoutesRequests(t *testing.T) {
 
 	resolveProxyTarget = func(target string) *url.URL {
 		switch target {
-		case "login.tailscale.com":
+		case upstreamRoleLogin:
 			return mustParseURL(t, loginUpstream.server.URL)
-		case "controlplane.tailscale.com":
+		case upstreamRoleControl:
 			return mustParseURL(t, controlplaneUpstream.server.URL)
-		case "derp.tailscale.com":
+		case upstreamRoleDERP:
 			return mustParseURL(t, derpUpstream.server.URL)
 		default:
 			t.Fatalf("unexpected target %q", target)
@@ -230,6 +287,47 @@ func TestBuildMainHandlerRoutesRequests(t *testing.T) {
 	}
 }
 
+func TestBuildMainHandlerRoutesCustomControlButKeepsDefaultDERP(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	httpOnly = true
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://headscale.example.com"),
+		control: mustParseURL(t, "https://headscale.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	controlplaneUpstream := newRecordedUpstream(t, "controlplane", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("controlplane"))
+	})
+	derpUpstream := newRecordedUpstream(t, "derp", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("derp"))
+	})
+
+	resolveProxyTarget = func(target string) *url.URL {
+		switch target {
+		case upstreamRoleLogin, upstreamRoleControl:
+			return mustParseURL(t, controlplaneUpstream.server.URL)
+		case upstreamRoleDERP:
+			return mustParseURL(t, derpUpstream.server.URL)
+		default:
+			t.Fatalf("unexpected target %q", target)
+			return nil
+		}
+	}
+
+	proxy := httptest.NewServer(buildMainHandler(nil))
+	t.Cleanup(proxy.Close)
+
+	assertProxyResponseBody(t, proxy.Client(), proxy.URL+"/login", "controlplane")
+	assertProxyResponseBody(t, proxy.Client(), proxy.URL+"/key", "controlplane")
+	assertProxyResponseBody(t, proxy.Client(), proxy.URL+"/derp/map", "derp")
+
+	if got := activeUpstreams.derp.String(); got != "https://derp.tailscale.com" {
+		t.Fatalf("derp upstream = %q", got)
+	}
+}
+
 func TestBuildMainHandlerRewritesResponses(t *testing.T) {
 	withProxyTestGlobals(t)
 	domain = "proxy.example.com"
@@ -268,6 +366,43 @@ func TestBuildMainHandlerRewritesResponses(t *testing.T) {
 	}
 }
 
+func TestBuildMainHandlerRewritesCustomRegisterResponses(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://upstream.example.com"),
+		control: mustParseURL(t, "https://upstream.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	const registerURL = "https://upstream.example.com/register/token-123?via=cli"
+	upstream := newRecordedUpstream(t, "controlplane", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Location", registerURL)
+		_, _ = w.Write([]byte("visit " + registerURL))
+	})
+
+	resolveProxyTarget = func(target string) *url.URL {
+		return mustParseURL(t, upstream.server.URL)
+	}
+
+	proxy := httptest.NewServer(buildMainHandler(nil))
+	t.Cleanup(proxy.Close)
+
+	resp, err := proxy.Client().Get(proxy.URL + "/register/token-123")
+	if err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Location"); got != "https://proxy.example.com/register/token-123?via=cli" {
+		t.Fatalf("Location = %q, want rewritten register URL", got)
+	}
+	if body := readBody(t, resp.Body); body != "visit https://proxy.example.com/register/token-123?via=cli" {
+		t.Fatalf("body = %q, want rewritten register URL", body)
+	}
+}
+
 func TestTS2021HandlerPreservesMethodAndUpgradeHeaders(t *testing.T) {
 	withProxyTestGlobals(t)
 
@@ -288,6 +423,12 @@ func TestTS2021HandlerPreservesMethodAndUpgradeHeaders(t *testing.T) {
 	t.Cleanup(backend.Close)
 
 	dialControlPlane = func(network, addr string, config *tls.Config) (net.Conn, error) {
+		if addr != "controlplane.tailscale.com:443" {
+			t.Fatalf("dial addr = %q, want %q", addr, "controlplane.tailscale.com:443")
+		}
+		if config.ServerName != "controlplane.tailscale.com" {
+			t.Fatalf("server name = %q", config.ServerName)
+		}
 		return tls.Dial(network, strings.TrimPrefix(backend.URL, "https://"), &tls.Config{
 			InsecureSkipVerify: true,
 		})
@@ -329,6 +470,149 @@ func TestTS2021HandlerPreservesMethodAndUpgradeHeaders(t *testing.T) {
 	}
 }
 
+func TestTS2021HandlerRewritesRegisterURLsInNonUpgradeResponse(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+
+	const registerURL = "https://controlplane.tailscale.com/register/token-456?via=ts2021"
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ts2021" {
+			t.Fatalf("backend path = %q, want /ts2021", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Location", registerURL)
+		_, _ = w.Write([]byte(`{"register":"` + registerURL + `"}`))
+	}))
+	t.Cleanup(backend.Close)
+
+	dialControlPlane = func(network, addr string, config *tls.Config) (net.Conn, error) {
+		if addr != "controlplane.tailscale.com:443" {
+			t.Fatalf("dial addr = %q, want controlplane.tailscale.com:443", addr)
+		}
+		if config.ServerName != "controlplane.tailscale.com" {
+			t.Fatalf("server name = %q, want controlplane.tailscale.com", config.ServerName)
+		}
+		return tls.Dial(network, strings.TrimPrefix(backend.URL, "https://"), &tls.Config{
+			InsecureSkipVerify: true,
+		})
+	}
+
+	proxy := httptest.NewServer(buildMainHandler(nil))
+	t.Cleanup(proxy.Close)
+
+	req, err := http.NewRequest(http.MethodPost, proxy.URL+"/ts2021", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Connection", "upgrade")
+	req.Header.Set("Upgrade", "tailscale-control-protocol")
+
+	resp, err := proxy.Client().Do(req)
+	if err != nil {
+		t.Fatalf("ts2021 request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Location"); got != "https://proxy.example.com/register/token-456?via=ts2021" {
+		t.Fatalf("Location = %q, want rewritten register URL", got)
+	}
+	if body := readBody(t, resp.Body); body != `{"register":"https://proxy.example.com/register/token-456?via=ts2021"}` {
+		t.Fatalf("body = %q, want rewritten register URL", body)
+	}
+}
+
+func TestTS2021HandlerDoesNotRewriteSwitchingProtocolsTrafficInTransparentMode(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+
+	const streamPayload = "https://upstream.example.com/register/token-789?via=tunnel"
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hijacker, ok := w.(http.Hijacker)
+		if !ok {
+			t.Fatal("backend response writer does not support hijacking")
+		}
+		conn, rw, err := hijacker.Hijack()
+		if err != nil {
+			t.Fatalf("backend hijack: %v", err)
+		}
+		defer conn.Close()
+
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+		_, _ = rw.WriteString("Connection: Upgrade\r\n")
+		_, _ = rw.WriteString("Upgrade: tailscale-control-protocol\r\n")
+		_, _ = rw.WriteString("\r\n")
+		if err := rw.Flush(); err != nil {
+			t.Fatalf("backend flush: %v", err)
+		}
+
+		if _, err := io.WriteString(conn, streamPayload); err != nil {
+			t.Fatalf("backend write payload: %v", err)
+		}
+	}))
+	t.Cleanup(backend.Close)
+
+	dialControlPlane = func(network, addr string, config *tls.Config) (net.Conn, error) {
+		return tls.Dial(network, strings.TrimPrefix(backend.URL, "https://"), &tls.Config{
+			InsecureSkipVerify: true,
+		})
+	}
+
+	proxy := httptest.NewServer(buildMainHandler(nil))
+	t.Cleanup(proxy.Close)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(proxy.URL, "http://"))
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := io.WriteString(conn, "GET /ts2021 HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: Upgrade\r\nUpgrade: tailscale-control-protocol\r\n\r\n"); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Upgrade"); got != "tailscale-control-protocol" {
+		t.Fatalf("Upgrade = %q, want tailscale-control-protocol", got)
+	}
+
+	payload := make([]byte, len(streamPayload))
+	if _, err := io.ReadFull(reader, payload); err != nil {
+		t.Fatalf("read tunneled payload: %v", err)
+	}
+	if got := string(payload); got != streamPayload {
+		t.Fatalf("payload = %q, want %q", got, streamPayload)
+	}
+}
+
+func TestControlPlaneDialAddressUsesConfiguredControlUpstream(t *testing.T) {
+	withProxyTestGlobals(t)
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://headscale.example.com:8443"),
+		control: mustParseURL(t, "https://headscale.example.com:8443"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	dialAddr, serverName := controlPlaneDialAddress()
+	if dialAddr != "headscale.example.com:8443" {
+		t.Fatalf("dial addr = %q", dialAddr)
+	}
+	if serverName != "headscale.example.com" {
+		t.Fatalf("server name = %q", serverName)
+	}
+}
+
 func TestTS2021HandlerReturnsBadGatewayOnDialFailure(t *testing.T) {
 	withProxyTestGlobals(t)
 
@@ -362,10 +646,18 @@ func withProxyTestGlobals(t *testing.T) {
 	oldDebug := debug
 	oldHTTPOnly := httpOnly
 	oldBindAddr := bindAddr
+	oldUpstreamURL := upstreamURL
+	oldUpstreamDERPURL := upstreamDERPURL
+	oldTS2021KeyFile := ts2021KeyFile
 	oldLogger := logger
+	oldActiveUpstreams := activeUpstreams
 	oldResolveProxyTarget := resolveProxyTarget
 	oldDialControlPlane := dialControlPlane
+	oldTS2021Proxy := activeTS2021Proxy
 
+	ts2021ServerKeyOnce = sync.Once{}
+	ts2021ServerKey = key.MachinePrivate{}
+	ts2021ServerKeyErr = nil
 	domain = "proxy.example.com"
 	port = "80"
 	httpsPort = "443"
@@ -375,9 +667,14 @@ func withProxyTestGlobals(t *testing.T) {
 	debug = false
 	httpOnly = false
 	bindAddr = "127.0.0.1"
+	upstreamURL = ""
+	upstreamDERPURL = ""
+	ts2021KeyFile = ""
 	logger = nil
+	activeUpstreams = defaultUpstreamConfig()
 	resolveProxyTarget = oldResolveProxyTarget
 	dialControlPlane = oldDialControlPlane
+	activeTS2021Proxy = newTS2021Proxy()
 
 	t.Cleanup(func() {
 		domain = oldDomain
@@ -389,9 +686,17 @@ func withProxyTestGlobals(t *testing.T) {
 		debug = oldDebug
 		httpOnly = oldHTTPOnly
 		bindAddr = oldBindAddr
+		upstreamURL = oldUpstreamURL
+		upstreamDERPURL = oldUpstreamDERPURL
+		ts2021KeyFile = oldTS2021KeyFile
 		logger = oldLogger
+		activeUpstreams = oldActiveUpstreams
 		resolveProxyTarget = oldResolveProxyTarget
 		dialControlPlane = oldDialControlPlane
+		activeTS2021Proxy = oldTS2021Proxy
+		ts2021ServerKeyOnce = sync.Once{}
+		ts2021ServerKey = key.MachinePrivate{}
+		ts2021ServerKeyErr = nil
 	})
 }
 

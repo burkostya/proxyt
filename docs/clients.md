@@ -14,6 +14,8 @@ Once your proxy is running, configure Tailscale clients to use your custom domai
 tailscale login --login-server https://proxy.example.com
 ```
 
+If ProxyT is fronting a custom control plane such as Headscale, the client-side command stays the same. The change is on the ProxyT side, where you set `--upstream-url https://headscale.example.com`.
+
 Use a different device to login to Tailscale using the provider URL.
 
 ## QR code login
@@ -34,3 +36,19 @@ For automated deployments with pre-authorized keys:
 tailscale login --login-server https://proxy.example.com --auth-key tskey-auth-xxxxx
 ```
 
+## Headscale / Custom Control Plane
+
+Example ProxyT startup for a Headscale-backed deployment:
+
+```bash
+proxyt serve \
+  --domain proxy.example.com \
+  --http-only \
+  --port 8080 \
+  --upstream-url https://headscale.example.com
+```
+
+In this mode:
+
+- Login, registration, `/api/*`, `/machine/*`, and `/ts2021` go to your custom control server
+- DERP still goes to Tailscale unless you also set `--upstream-derp-url`

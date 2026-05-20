@@ -34,17 +34,175 @@ var (
 	debug              bool
 	httpOnly           bool
 	bindAddr           string
+	upstreamURL        string
+	upstreamDERPURL    string
+	ts2021KeyFile      string
 	logger             *log.Logger
+	activeUpstreams    = defaultUpstreamConfig()
 	resolveProxyTarget = func(target string) *url.URL {
-		return &url.URL{
-			Scheme: "https",
-			Host:   target,
-		}
+		return activeUpstreams.resolve(target)
 	}
 	dialControlPlane = func(network, addr string, config *tls.Config) (net.Conn, error) {
 		return tls.Dial(network, addr, config)
 	}
 )
+
+const (
+	upstreamRoleLogin   = "login"
+	upstreamRoleControl = "control"
+	upstreamRoleDERP    = "derp"
+)
+
+type upstreamConfig struct {
+	login   *url.URL
+	control *url.URL
+	derp    *url.URL
+}
+
+func defaultUpstreamConfig() upstreamConfig {
+	return upstreamConfig{
+		login:   mustParseUpstreamURL("https://login.tailscale.com"),
+		control: mustParseUpstreamURL("https://controlplane.tailscale.com"),
+		derp:    mustParseUpstreamURL("https://derp.tailscale.com"),
+	}
+}
+
+func mustParseUpstreamURL(raw string) *url.URL {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	return parsed
+}
+
+func (c upstreamConfig) resolve(role string) *url.URL {
+	switch role {
+	case upstreamRoleLogin:
+		return cloneURL(c.login)
+	case upstreamRoleControl:
+		return cloneURL(c.control)
+	case upstreamRoleDERP:
+		return cloneURL(c.derp)
+	default:
+		return nil
+	}
+}
+
+func cloneURL(in *url.URL) *url.URL {
+	if in == nil {
+		return nil
+	}
+	cloned := *in
+	return &cloned
+}
+
+func parseUpstreamConfig(controlRaw, derpRaw string) (upstreamConfig, error) {
+	cfg := defaultUpstreamConfig()
+
+	if controlRaw != "" {
+		parsedControl, err := parseUpstreamURL(controlRaw, "upstream-url")
+		if err != nil {
+			return upstreamConfig{}, err
+		}
+		cfg.login = parsedControl
+		cfg.control = parsedControl
+	}
+
+	if derpRaw != "" {
+		parsedDERP, err := parseUpstreamURL(derpRaw, "upstream-derp-url")
+		if err != nil {
+			return upstreamConfig{}, err
+		}
+		cfg.derp = parsedDERP
+	}
+
+	return cfg, nil
+}
+
+func parseUpstreamURL(raw, flagName string) (*url.URL, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be a valid URL: %w", flagName, err)
+	}
+	if parsed.Scheme != "https" {
+		return nil, fmt.Errorf("%s must use https", flagName)
+	}
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("%s must include a host", flagName)
+	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("%s must not include user info", flagName)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("%s must not include a query string or fragment", flagName)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return nil, fmt.Errorf("%s must not include a path", flagName)
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	return parsed, nil
+}
+
+func controlPlaneDialAddress() (addr string, serverName string) {
+	control := activeUpstreams.control
+	serverName = control.Hostname()
+	addr = control.Host
+	if control.Port() == "" {
+		addr = net.JoinHostPort(serverName, "443")
+	}
+	return addr, serverName
+}
+
+func upstreamRewriteSources() []string {
+	defaults := defaultUpstreamConfig()
+	sources := []string{
+		"https://login.tailscale.com",
+		"http://login.tailscale.com",
+		"https://controlplane.tailscale.com",
+		"http://controlplane.tailscale.com",
+		"//login.tailscale.com",
+		"//controlplane.tailscale.com",
+	}
+
+	for _, upstream := range []*url.URL{activeUpstreams.login, activeUpstreams.control} {
+		if upstream == nil {
+			continue
+		}
+		sources = append(sources,
+			upstreamOrigin(upstream, "https"),
+			upstreamOrigin(upstream, "http"),
+			"//"+upstream.Host,
+		)
+	}
+
+	if activeUpstreams.derp != nil && activeUpstreams.derp.Host != defaults.derp.Host {
+		sources = append(sources,
+			upstreamOrigin(activeUpstreams.derp, "https"),
+			upstreamOrigin(activeUpstreams.derp, "http"),
+			"//"+activeUpstreams.derp.Host,
+		)
+	}
+
+	return dedupeStrings(sources)
+}
+
+func upstreamOrigin(target *url.URL, scheme string) string {
+	return scheme + "://" + target.Host
+}
+
+func dedupeStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
 
 // serveCmd represents the serve command
 var serveCmd = &cobra.Command{
@@ -68,6 +226,9 @@ func init() {
 	serveCmd.Flags().BoolVar(&debug, "debug", false, "Enable debug logging for all requests")
 	serveCmd.Flags().BoolVar(&httpOnly, "http-only", false, "Run in HTTP-only mode (for use behind HTTPS proxy/load balancer)")
 	serveCmd.Flags().StringVar(&bindAddr, "bind", "0.0.0.0", "Address to bind the server to")
+	serveCmd.Flags().StringVar(&upstreamURL, "upstream-url", "", "Custom control/login upstream URL (for example https://headscale.example.com)")
+	serveCmd.Flags().StringVar(&upstreamDERPURL, "upstream-derp-url", "", "Optional custom DERP upstream URL")
+	serveCmd.Flags().StringVar(&ts2021KeyFile, "ts2021-key-file", "", "Path to a persistent TS2021 proxy private key file")
 
 	// Bind environment variables
 	viper.SetEnvPrefix("PROXYT")
@@ -82,6 +243,9 @@ func init() {
 	viper.BindPFlag("debug", serveCmd.Flags().Lookup("debug"))
 	viper.BindPFlag("http-only", serveCmd.Flags().Lookup("http-only"))
 	viper.BindPFlag("bind", serveCmd.Flags().Lookup("bind"))
+	viper.BindPFlag("upstream-url", serveCmd.Flags().Lookup("upstream-url"))
+	viper.BindPFlag("upstream-derp-url", serveCmd.Flags().Lookup("upstream-derp-url"))
+	viper.BindPFlag("ts2021-key-file", serveCmd.Flags().Lookup("ts2021-key-file"))
 }
 
 func runProxy() {
@@ -95,6 +259,9 @@ func runProxy() {
 	debug = viper.GetBool("debug")
 	httpOnly = viper.GetBool("http-only")
 	bindAddr = viper.GetString("bind")
+	upstreamURL = viper.GetString("upstream-url")
+	upstreamDERPURL = viper.GetString("upstream-derp-url")
+	ts2021KeyFile = viper.GetString("ts2021-key-file")
 
 	var err error
 	logger, err = newRuntimeLogger(debug)
@@ -104,20 +271,30 @@ func runProxy() {
 	}
 	defer closeRuntimeLogger(logger)
 
-	logger.Info("Starting Tailscale proxy",
-		log.String("domain", domain),
-		log.Bool("http_only", httpOnly))
-
-	if debug {
-		logger.Info("Debug logging enabled")
-	}
-
 	// Validate required flags based on mode
 	if domain == "" {
 		logger.Fatal("domain is required")
 	}
 	if !httpOnly && certDir == "" {
 		logger.Fatal("cert-dir is required when not using --http-only mode")
+	}
+
+	activeUpstreams, err = parseUpstreamConfig(upstreamURL, upstreamDERPURL)
+	if err != nil {
+		logger.Fatal("invalid upstream configuration", log.Error(err))
+	}
+	if err := requirePersistentTS2021KeyForCustomUpstream(); err != nil {
+		logger.Fatal("invalid TS2021 proxy key configuration", log.Error(err))
+	}
+
+	logger.Info("Starting Tailscale proxy",
+		log.String("domain", domain),
+		log.Bool("http_only", httpOnly),
+		log.String("control_upstream", activeUpstreams.control.String()),
+		log.String("derp_upstream", activeUpstreams.derp.String()))
+
+	if debug {
+		logger.Info("Debug logging enabled")
 	}
 
 	var certManager *autocert.Manager
@@ -388,36 +565,7 @@ func buildReverseProxy(transport http.RoundTripper) *httputil.ReverseProxy {
 				}
 			}
 
-			if location := resp.Header.Get("Location"); location != "" {
-				if newLocation := rewriteTailscaleURL(location); newLocation != location {
-					logger.Info("Rewriting Location header",
-						log.String("from", location),
-						log.String("to", newLocation))
-					resp.Header.Set("Location", newLocation)
-				}
-			}
-
-			contentType := resp.Header.Get("Content-Type")
-			if strings.Contains(contentType, "application/json") ||
-				strings.Contains(contentType, "text/html") ||
-				strings.Contains(contentType, "text/plain") {
-				body, err := io.ReadAll(resp.Body)
-				if err != nil {
-					return err
-				}
-				_ = resp.Body.Close()
-
-				rewrittenBody := rewriteTailscaleURLsInBody(string(body))
-				if rewrittenBody != string(body) {
-					logger.Info("Rewrote URLs in response body", log.Int("bytes", len(rewrittenBody)))
-				}
-
-				resp.Body = io.NopCloser(strings.NewReader(rewrittenBody))
-				resp.ContentLength = int64(len(rewrittenBody))
-				resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(rewrittenBody)))
-			}
-
-			return nil
+			return rewriteProxyResponse(resp)
 		},
 	}
 
@@ -456,9 +604,8 @@ func logDebugRequest(phase string, r *http.Request) {
 	}
 }
 
-// getTailscaleTarget determines which Tailscale service to route to based on the request
+// getTailscaleTarget determines which upstream role to route to based on the request.
 func getTailscaleTarget(r *http.Request) string {
-	// Check the request path and headers to determine the appropriate Tailscale service
 	path := r.URL.Path
 	userAgent := r.Header.Get("User-Agent")
 	authHeader := r.Header.Get("Authorization")
@@ -476,65 +623,71 @@ func getTailscaleTarget(r *http.Request) string {
 	// Route based on path patterns - prioritize API endpoints first
 	switch {
 	case strings.HasPrefix(path, "/ts2021"):
-		// Tailscale control protocol upgrade endpoint
 		logger.Info("Tailscale control protocol upgrade request detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/key"):
-		// Key exchange - always goes to controlplane
 		logger.Info("Key exchange request detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/api/"):
-		// All API calls go to controlplane (including /api/v2/)
 		logger.Info("API request detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/machine/"):
-		// Machine registration and updates
 		logger.Info("Machine API request detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/derp/"):
-		// DERP relay traffic
 		logger.Info("DERP request detected, routing to derp")
-		return "derp.tailscale.com"
+		return upstreamRoleDERP
 	case strings.HasPrefix(path, "/bootstrap-dns"):
-		// DNS bootstrap
 		logger.Info("DNS bootstrap request detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/register"):
-		// Registration requests
 		logger.Info("Registration request detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/c/"):
-		// Control plane endpoints
 		logger.Info("Control plane endpoint detected, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case authHeader != "" && strings.Contains(userAgent, "tailscale"):
-		// Tailscale client with auth header (likely auth key flow)
 		logger.Info("Authenticated Tailscale client request, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.Contains(userAgent, "tailscale"):
-		// Other Tailscale client requests
 		if strings.Contains(path, "login") || strings.Contains(path, "auth") {
 			logger.Info("Tailscale client login/auth request, routing to login")
-			return "login.tailscale.com"
+			return upstreamRoleLogin
 		}
-		// Default to controlplane for other client requests
 		logger.Info("Tailscale client request, routing to controlplane")
-		return "controlplane.tailscale.com"
+		return upstreamRoleControl
 	case strings.HasPrefix(path, "/login") || strings.HasPrefix(path, "/auth") || strings.HasPrefix(path, "/a/"):
-		// Login/auth web requests
 		logger.Info("Web login/auth request, routing to login")
-		return "login.tailscale.com"
+		return upstreamRoleLogin
 	default:
-		// Default to login for web-based access
 		if debug {
 			logger.Debug("Default routing to login")
 		}
-		return "login.tailscale.com"
+		return upstreamRoleLogin
 	}
 }
 
 // handleTailscaleControlProtocol handles the /ts2021 endpoint with custom protocol upgrade
 func handleTailscaleControlProtocol(w http.ResponseWriter, r *http.Request) {
+	if shouldProxyTS2021() {
+		activeTS2021Proxy.ServeHTTP(w, r)
+		return
+	}
+
+	transparentTunnelTS2021(w, r)
+}
+
+func shouldProxyTS2021() bool {
+	return isCustomControlUpstream()
+}
+
+func isCustomControlUpstream() bool {
+	defaults := defaultUpstreamConfig()
+	return activeUpstreams.control.String() != defaults.control.String()
+}
+
+// transparentTunnelTS2021 preserves the historical raw tunnel behavior.
+func transparentTunnelTS2021(w http.ResponseWriter, r *http.Request) {
 	if debug {
 		logDebugRequest("TS2021_HANDLER", r)
 	}
@@ -555,8 +708,9 @@ func handleTailscaleControlProtocol(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Connect to the backend first
-	backendConn, err := dialControlPlane("tcp", "controlplane.tailscale.com:443", &tls.Config{
-		ServerName: "controlplane.tailscale.com",
+	controlPlaneAddr, controlPlaneServerName := controlPlaneDialAddress()
+	backendConn, err := dialControlPlane("tcp", controlPlaneAddr, &tls.Config{
+		ServerName: controlPlaneServerName,
 	})
 	if err != nil {
 		logger.Error("Error connecting to backend",
@@ -600,6 +754,17 @@ func handleTailscaleControlProtocol(w http.ResponseWriter, r *http.Request) {
 		log.String("status", resp.Status),
 		log.String("connection", resp.Header.Get("Connection")),
 		log.String("upgrade", resp.Header.Get("Upgrade")))
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		if err := rewriteProxyResponse(resp); err != nil {
+			logger.Error("Error rewriting control protocol response",
+				log.String("method", r.Method),
+				log.String("path", r.URL.Path),
+				log.Error(err))
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			return
+		}
+	}
 
 	// Copy response headers to client
 	for name, values := range resp.Header {
@@ -661,41 +826,82 @@ func handleTailscaleControlProtocol(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// rewriteTailscaleURL rewrites Tailscale URLs to use the custom domain
-func rewriteTailscaleURL(url string) string {
-	// Replace Tailscale domains with our custom domain
-	url = strings.Replace(url, "https://login.tailscale.com", "https://"+domain, -1)
-	url = strings.Replace(url, "https://controlplane.tailscale.com", "https://"+domain, -1)
-	url = strings.Replace(url, "http://login.tailscale.com", "https://"+domain, -1)
-	url = strings.Replace(url, "http://controlplane.tailscale.com", "https://"+domain, -1)
+func rewriteProxyResponse(resp *http.Response) error {
+	if isCustomControlUpstream() && resp.Request != nil && resp.Request.URL.Path == "/key" {
+		if err := rewriteControlKeyResponse(resp); err != nil {
+			return err
+		}
+	}
 
-	// Also handle protocol-relative URLs
-	url = strings.Replace(url, "//login.tailscale.com", "//"+domain, -1)
-	url = strings.Replace(url, "//controlplane.tailscale.com", "//"+domain, -1)
+	rewriteLocationHeader(resp.Header)
 
-	return url
+	if !shouldRewriteResponseBody(resp) {
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+
+	rewrittenBody := rewriteTailscaleURLsInBody(string(body))
+	if rewrittenBody != string(body) {
+		logger.Info("Rewrote URLs in response body", log.Int("bytes", len(rewrittenBody)))
+	}
+
+	resp.Body = io.NopCloser(strings.NewReader(rewrittenBody))
+	resp.ContentLength = int64(len(rewrittenBody))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(rewrittenBody)))
+
+	return nil
 }
 
-// rewriteTailscaleURLsInBody rewrites Tailscale URLs in response body content
+func rewriteLocationHeader(header http.Header) {
+	if location := header.Get("Location"); location != "" {
+		if newLocation := rewriteTailscaleURL(location); newLocation != location {
+			logger.Info("Rewriting Location header",
+				log.String("from", location),
+				log.String("to", newLocation))
+			header.Set("Location", newLocation)
+		}
+	}
+}
+
+func shouldRewriteResponseBody(resp *http.Response) bool {
+	if resp == nil || resp.Body == nil {
+		return false
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	return strings.Contains(contentType, "application/json") ||
+		strings.Contains(contentType, "text/html") ||
+		strings.Contains(contentType, "text/plain")
+}
+
+// rewriteTailscaleURL rewrites known upstream URLs to use the public proxy domain.
+func rewriteTailscaleURL(raw string) string {
+	rewritten := raw
+	for _, source := range upstreamRewriteSources() {
+		replacement := "https://" + domain
+		if strings.HasPrefix(source, "//") {
+			replacement = "//" + domain
+		}
+		rewritten = strings.ReplaceAll(rewritten, source, replacement)
+	}
+	return rewritten
+}
+
+// rewriteTailscaleURLsInBody rewrites upstream URLs in response body content.
 func rewriteTailscaleURLsInBody(body string) string {
-	// Use regex to find and replace Tailscale URLs in the body
-	tailscaleURLRegex := regexp.MustCompile(`https?://(login|controlplane)\.tailscale\.com`)
-	body = tailscaleURLRegex.ReplaceAllStringFunc(body, func(match string) string {
-		return rewriteTailscaleURL(match)
-	})
-
-	// Also handle protocol-relative URLs
-	protocolRelativeRegex := regexp.MustCompile(`//(login|controlplane)\.tailscale\.com`)
-	body = protocolRelativeRegex.ReplaceAllStringFunc(body, func(match string) string {
-		return "//" + domain
-	})
-
-	// Handle quoted URLs in JSON
-	quotedURLRegex := regexp.MustCompile(`"https?://(login|controlplane)\.tailscale\.com([^"]*)"`)
-	body = quotedURLRegex.ReplaceAllStringFunc(body, func(match string) string {
-		return rewriteTailscaleURL(match)
-	})
-
+	for _, source := range upstreamRewriteSources() {
+		replacement := "https://" + domain
+		if strings.HasPrefix(source, "//") {
+			replacement = "//" + domain
+		}
+		pattern := regexp.QuoteMeta(source)
+		body = regexp.MustCompile(pattern).ReplaceAllString(body, replacement)
+	}
 	return body
 }
 
