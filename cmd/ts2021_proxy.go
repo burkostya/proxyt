@@ -227,6 +227,27 @@ func (h *ts2021ProxyHandler) ProxyHTTPRequest(req *http.Request) (*http.Response
 		log.Int("status_code", resp.StatusCode),
 		log.String("status", resp.Status),
 		log.String("duration", time.Since(started).String()))
+
+	if resp.Request == nil {
+		resp.Request = cloned
+	}
+
+	rewriteFields := []log.Field{
+		log.String("client_peer", h.clientPeer.String()),
+		log.Int("protocol_version", h.protocolVersion),
+		log.String("method", req.Method),
+		log.String("path", req.URL.Path),
+		log.String("query", req.URL.RawQuery),
+		log.String("upstream_host", activeUpstreams.control.Host),
+		log.Int("status_code", resp.StatusCode),
+	}
+	if _, err := rewriteProxyResponseWithDiagnostics(resp, rewriteFields); err != nil {
+		logger.Error("Failed to rewrite TS2021 in-session HTTP response",
+			append(rewriteFields,
+				log.Error(err),
+				log.String("duration", time.Since(started).String()))...)
+		return nil, err
+	}
 	return resp, nil
 }
 

@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
+	log "github.com/jaxxstorm/log"
 	"golang.org/x/net/http2"
 	"tailscale.com/control/controlhttp"
 	"tailscale.com/control/controlhttp/controlhttpserver"
@@ -457,6 +459,179 @@ func TestProxiedTS2021RegisterRewrite(t *testing.T) {
 	}
 }
 
+func TestTS2021ProxyHTTPRequestRewritesJSONBody(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://upstream.example.com"),
+		control: mustParseURL(t, "https://upstream.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	handler := &ts2021ProxyHandler{
+		upstream: &fakeTS2021UpstreamSession{
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body: io.NopCloser(bytes.NewBufferString(
+					`{"PopBrowserURL":"https://upstream.example.com/a/session-123","ControlURL":"https://upstream.example.com/machine/map"}`,
+				)),
+			},
+		},
+		clientPeer:      key.NewMachine().Public(),
+		protocolVersion: 99,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/machine/map", nil)
+	resp, err := handler.ProxyHTTPRequest(req)
+	if err != nil {
+		t.Fatalf("ProxyHTTPRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	bodyText := string(body)
+	if strings.Contains(bodyText, "upstream.example.com") {
+		t.Fatalf("body still contains upstream host: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "https://proxy.example.com/a/session-123") {
+		t.Fatalf("body missing rewritten PopBrowserURL: %s", bodyText)
+	}
+	if !strings.Contains(bodyText, "https://proxy.example.com/machine/map") {
+		t.Fatalf("body missing rewritten ControlURL: %s", bodyText)
+	}
+}
+
+func TestTS2021ProxyHTTPRequestRewritesLocationHeader(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://upstream.example.com"),
+		control: mustParseURL(t, "https://upstream.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	handler := &ts2021ProxyHandler{
+		upstream: &fakeTS2021UpstreamSession{
+			response: &http.Response{
+				StatusCode: http.StatusTemporaryRedirect,
+				Header: http.Header{
+					"Location":     []string{"https://upstream.example.com/register/device-123"},
+					"Content-Type": []string{"text/plain"},
+				},
+				Body: io.NopCloser(bytes.NewBufferString("redirecting")),
+			},
+		},
+		clientPeer:      key.NewMachine().Public(),
+		protocolVersion: 99,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/register", nil)
+	resp, err := handler.ProxyHTTPRequest(req)
+	if err != nil {
+		t.Fatalf("ProxyHTTPRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Location"); got != "https://proxy.example.com/register/device-123" {
+		t.Fatalf("Location = %q", got)
+	}
+}
+
+func TestTS2021ProxyHTTPRequestLeavesBinaryBodyUntouched(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://upstream.example.com"),
+		control: mustParseURL(t, "https://upstream.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	payload := []byte{0x00, 0x01, 0x02, 0xff}
+	handler := &ts2021ProxyHandler{
+		upstream: &fakeTS2021UpstreamSession{
+			response: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/octet-stream"}},
+				Body:       io.NopCloser(bytes.NewReader(payload)),
+			},
+		},
+		clientPeer:      key.NewMachine().Public(),
+		protocolVersion: 99,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "https://proxy.example.com/machine/bin", nil)
+	resp, err := handler.ProxyHTTPRequest(req)
+	if err != nil {
+		t.Fatalf("ProxyHTTPRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("binary payload changed: got %v want %v", got, payload)
+	}
+}
+
+func TestRewriteProxyResponseLogsRemainingUpstreamHost(t *testing.T) {
+	withProxyTestGlobals(t)
+	domain = "proxy.example.com"
+	activeUpstreams = upstreamConfig{
+		login:   mustParseURL(t, "https://upstream.example.com"),
+		control: mustParseURL(t, "https://upstream.example.com"),
+		derp:    mustParseURL(t, "https://derp.tailscale.com"),
+	}
+
+	var output bytes.Buffer
+	var err error
+	logger, err = buildRuntimeLogger(false, &output, "")
+	if err != nil {
+		t.Fatalf("buildRuntimeLogger: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = logger.Close()
+	})
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(bytes.NewBufferString(`{"control_host":"upstream.example.com"}`)),
+		Request: &http.Request{
+			Method: http.MethodGet,
+			URL:    mustParseURL(t, "https://upstream.example.com/machine/map"),
+		},
+	}
+
+	report, err := rewriteProxyResponseWithDiagnostics(resp, []log.Field{log.String("path", "/machine/map")})
+	if err != nil {
+		t.Fatalf("rewriteProxyResponseWithDiagnostics: %v", err)
+	}
+	if len(report.remainingHosts) == 0 {
+		t.Fatal("expected remaining upstream host to be reported")
+	}
+
+	records := decodeLogRecords(t, loggedBytes(&output))
+	if len(records) == 0 {
+		t.Fatal("expected diagnostic log records")
+	}
+	last := records[len(records)-1]
+	if got := last["msg"]; got != "Upstream host remained after response rewrite" {
+		t.Fatalf("msg = %v", got)
+	}
+	if got := last["upstream_host_leak_detected"]; got != true {
+		t.Fatalf("upstream_host_leak_detected = %v, want true", got)
+	}
+	if got := last["remaining_upstream_hosts"]; got != "upstream.example.com" {
+		t.Fatalf("remaining_upstream_hosts = %v", got)
+	}
+}
+
 type fakeTS2021ClientSession struct {
 	registerRequest          *tailcfg.RegisterRequest
 	receivedRegisterResponse *tailcfg.RegisterResponse
@@ -485,11 +660,17 @@ func (s *fakeTS2021ClientSession) Peer() key.MachinePublic {
 
 type fakeTS2021UpstreamSession struct {
 	registerResponse *tailcfg.RegisterResponse
+	response         *http.Response
 	roundTrips       int
 }
 
 func (s *fakeTS2021UpstreamSession) RoundTrip(req *http.Request) (*http.Response, error) {
 	s.roundTrips++
+	if s.response != nil {
+		resp := *s.response
+		resp.Request = req
+		return &resp, nil
+	}
 	body, err := json.Marshal(s.registerResponse)
 	if err != nil {
 		return nil, err
@@ -498,6 +679,7 @@ func (s *fakeTS2021UpstreamSession) RoundTrip(req *http.Request) (*http.Response
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"application/json"}},
 		Body:       io.NopCloser(bytes.NewReader(body)),
+		Request:    req,
 	}, nil
 }
 

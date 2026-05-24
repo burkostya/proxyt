@@ -827,45 +827,76 @@ func transparentTunnelTS2021(w http.ResponseWriter, r *http.Request) {
 }
 
 func rewriteProxyResponse(resp *http.Response) error {
+	_, err := rewriteProxyResponseWithDiagnostics(resp, nil)
+	return err
+}
+
+type responseRewriteReport struct {
+	locationRewritten bool
+	bodyRewriteTried  bool
+	bodyRewritten     bool
+	contentType       string
+	remainingHosts    []string
+	bodyPreview       string
+}
+
+func rewriteProxyResponseWithDiagnostics(resp *http.Response, fields []log.Field) (responseRewriteReport, error) {
+	report := responseRewriteReport{}
+	if resp == nil {
+		return report, nil
+	}
+
 	if isCustomControlUpstream() && resp.Request != nil && resp.Request.URL.Path == "/key" {
 		if err := rewriteControlKeyResponse(resp); err != nil {
-			return err
+			return report, err
 		}
 	}
 
-	rewriteLocationHeader(resp.Header)
+	report.contentType = resp.Header.Get("Content-Type")
+	report.locationRewritten = rewriteLocationHeader(resp.Header)
 
 	if !shouldRewriteResponseBody(resp) {
-		return nil
+		logResponseRewriteDiagnostics(report, fields)
+		return report, nil
 	}
+	report.bodyRewriteTried = true
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return report, err
 	}
 	_ = resp.Body.Close()
 
-	rewrittenBody := rewriteTailscaleURLsInBody(string(body))
-	if rewrittenBody != string(body) {
+	originalBody := string(body)
+	rewrittenBody := rewriteTailscaleURLsInBody(originalBody)
+	report.bodyRewritten = rewrittenBody != originalBody
+	if report.bodyRewritten {
 		logger.Info("Rewrote URLs in response body", log.Int("bytes", len(rewrittenBody)))
+	}
+	report.remainingHosts = detectUpstreamHostLeaks(rewrittenBody)
+	if len(report.remainingHosts) > 0 {
+		report.bodyPreview = truncateForLog(rewrittenBody, 256)
 	}
 
 	resp.Body = io.NopCloser(strings.NewReader(rewrittenBody))
 	resp.ContentLength = int64(len(rewrittenBody))
 	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(rewrittenBody)))
 
-	return nil
+	logResponseRewriteDiagnostics(report, fields)
+	return report, nil
 }
 
-func rewriteLocationHeader(header http.Header) {
+func rewriteLocationHeader(header http.Header) bool {
 	if location := header.Get("Location"); location != "" {
 		if newLocation := rewriteTailscaleURL(location); newLocation != location {
 			logger.Info("Rewriting Location header",
 				log.String("from", location),
 				log.String("to", newLocation))
 			header.Set("Location", newLocation)
+			return true
 		}
 	}
+	return false
 }
 
 func shouldRewriteResponseBody(resp *http.Response) bool {
@@ -903,6 +934,70 @@ func rewriteTailscaleURLsInBody(body string) string {
 		body = regexp.MustCompile(pattern).ReplaceAllString(body, replacement)
 	}
 	return body
+}
+
+func detectUpstreamHostLeaks(body string) []string {
+	if body == "" {
+		return nil
+	}
+
+	hosts := make([]string, 0, 5)
+	defaults := defaultUpstreamConfig()
+	for _, upstream := range []*url.URL{
+		defaults.login,
+		defaults.control,
+		activeUpstreams.login,
+		activeUpstreams.control,
+		activeUpstreams.derp,
+	} {
+		if upstream == nil || upstream.Host == "" {
+			continue
+		}
+		hosts = append(hosts, upstream.Host)
+		hostname := upstream.Hostname()
+		if hostname != "" && hostname != upstream.Host {
+			hosts = append(hosts, hostname)
+		}
+	}
+
+	var leaks []string
+	for _, host := range dedupeStrings(hosts) {
+		if strings.Contains(body, host) {
+			leaks = append(leaks, host)
+		}
+	}
+	return dedupeStrings(leaks)
+}
+
+func truncateForLog(value string, limit int) string {
+	if limit <= 0 || len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "...(truncated)"
+}
+
+func logResponseRewriteDiagnostics(report responseRewriteReport, fields []log.Field) {
+	if logger == nil {
+		return
+	}
+
+	diagFields := append([]log.Field{}, fields...)
+	diagFields = append(diagFields,
+		log.String("content_type", report.contentType),
+		log.Bool("location_rewritten", report.locationRewritten),
+		log.Bool("body_rewrite_attempted", report.bodyRewriteTried),
+		log.Bool("body_rewritten", report.bodyRewritten),
+		log.Bool("upstream_host_leak_detected", len(report.remainingHosts) > 0))
+
+	if len(report.remainingHosts) > 0 {
+		diagFields = append(diagFields,
+			log.String("remaining_upstream_hosts", strings.Join(report.remainingHosts, ",")),
+			log.String("body_preview", report.bodyPreview))
+		logger.Warn("Upstream host remained after response rewrite", diagFields...)
+		return
+	}
+
+	logger.Info("Processed proxied response rewrite", diagFields...)
 }
 
 // min returns the minimum of two integers
